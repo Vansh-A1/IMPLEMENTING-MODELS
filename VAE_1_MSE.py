@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-#
+
 class Dataset_VAE(Dataset):
     def __init__(self, HR, transform=None):
         self.HR_DIR = HR
