@@ -1,281 +1,461 @@
-# Variational Autoencoder (VAE) From Scratch in PyTorch
+# Variational Autoencoder (VAE) from Scratch using PyTorch
+
+A complete implementation of a **Variational Autoencoder (VAE)** in **PyTorch** designed for learning compact latent representations of high-resolution images.
+
+This repository contains everything required to train, validate, monitor, and evaluate a convolutional VAE, including:
+
+- Complete Encoder–Decoder architecture
+- Reparameterization Trick
+- KL Divergence Regularization
+- Mixed Precision (AMP) Training
+- TensorBoard Visualization
+- PSNR & SSIM Evaluation
+- Gradient Clipping
+- Automatic Checkpoint Saving
+- Extensive Latent Space Diagnostics
+
+---
 
 ## Overview
 
-This repository contains a complete implementation of a **Variational Autoencoder (VAE)** built from scratch using PyTorch. The model is trained on high-resolution RGB images and incorporates several modern training techniques to improve stability and efficiency.
+The goal of this project is to learn a probabilistic latent representation of high-resolution images using a Variational Autoencoder.
+
+Unlike a traditional Autoencoder, the encoder learns the parameters of a probability distribution rather than a deterministic latent vector. During training, latent vectors are sampled using the Reparameterization Trick, allowing the model to generate new images while maintaining a smooth latent space.
 
 ---
 
 ## Features
 
-* Encoder-Decoder architecture
-* Reparameterization Trick
-* KL Divergence + Reconstruction Loss
-* Mixed Precision Training (AMP)
-* Gradient Clipping
-* Batch Normalization
-* LeakyReLU activations
-* Checkpoint Saving
-* GPU Support
-* Optimized Data Loading
+- Convolutional Encoder
+- Convolutional Decoder
+- Variational Latent Space
+- Reparameterization Trick
+- Group Normalization
+- Mixed Precision Training (FP16)
+- Automatic Gradient Scaling
+- Gradient Clipping
+- TensorBoard Logging
+- Model Checkpointing
+- Latent Space Embedding Visualization
+- Random Image Generation
+- Reconstruction Quality Metrics
+- Stable KL Divergence Training
 
 ---
 
-## Architecture
+## Model Architecture
 
 ### Encoder
 
-The encoder consists of several convolutional layers followed by two fully connected layers:
+Input Image
 
-* Mean layer (μ)
-* Log Variance layer (log σ²)
-
-Latent vector:
-
-```python
-z = μ + σϵ
+```
+1024 × 1024 × 3
 ```
 
-where:
+The encoder progressively downsamples the image using convolution layers.
 
-```python
-σ = exp(0.5 × logvar)
-ϵ ~ N(0,1)
 ```
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Conv → GroupNorm → LeakyReLU
+        ↓
+Flatten
+        ↓
+FC(mean)
+FC(log variance)
+```
+
+Output
+
+- Mean (μ)
+- Log Variance (log σ²)
+
+---
+
+### Latent Sampling
+
+The latent vector is sampled using
+
+```
+z = μ + σ × ε
+```
+
+where
+
+```
+σ = exp(logσ² / 2)
+
+ε ~ N(0,1)
+```
+
+This allows gradients to propagate through the stochastic sampling operation.
 
 ---
 
 ### Decoder
 
-The decoder reconstructs the image using:
+The decoder reconstructs the original image using transposed convolutions.
 
-* Fully connected layer
-* Transposed convolution layers
-* Tanh activation at the output
+```
+Latent Vector
+      ↓
+Fully Connected
+      ↓
+Reshape
+      ↓
+ConvTranspose
+      ↓
+ConvTranspose
+      ↓
+ConvTranspose
+      ↓
+ConvTranspose
+      ↓
+ConvTranspose
+      ↓
+ConvTranspose
+      ↓
+Tanh
+```
+
+Output
+
+```
+1024 × 1024 RGB Image
+```
 
 ---
 
 ## Loss Function
 
-The total VAE loss is:
-
-```python
-Loss = β × Reconstruction Loss + α × KL Divergence
-```
+The objective combines reconstruction quality with latent regularization.
 
 ### Reconstruction Loss
 
-Mean Squared Error (MSE):
+Mean Squared Error (MSE)
 
-```python
-F.mse_loss(output, target)
+```
+L_recon = ||x - x̂||²
 ```
 
 ### KL Divergence
 
-```python
--0.5 * torch.sum(
-    1 + logvar
-    - mean.pow(2)
-    - logvar.exp(),
-    dim=1
-).mean()
+```
+KL = -0.5 Σ(1 + logσ² − μ² − exp(logσ²))
 ```
 
-Default weights:
+### Total Loss
 
-* α = 0.001
-* β = 1.0
+```
+Loss = β × Reconstruction + α × KL
+```
+
+Current hyperparameters
+
+```
+alpha = 0.001
+beta = 1.0
+```
 
 ---
 
-## Training Techniques
+## Stability Improvements
 
-### Automatic Mixed Precision (AMP)
+Several modifications were implemented to improve training stability.
 
-Uses:
+### Group Normalization
 
-```python
-torch.cuda.amp.autocast()
-torch.cuda.amp.GradScaler()
+Batch Normalization was replaced by Group Normalization because:
+
+- independent of batch size
+- stable for batch size = 1
+- identical behaviour during training and validation
+
+---
+
+### Mean Clamping
+
+```
+mean = clamp(mean, -100, 100)
 ```
 
-Benefits:
+Prevents overflow during
 
-* Faster training
-* Lower GPU memory usage
-* Stable FP16 training
+```
+mean²
+```
+
+especially under mixed precision.
+
+---
+
+### Log Variance Clamping
+
+```
+logvar = clamp(logvar, -10, 10)
+```
+
+Prevents
+
+```
+exp(logvar)
+```
+
+from exploding.
 
 ---
 
 ### Gradient Clipping
 
-```python
-torch.nn.utils.clip_grad_norm_(
-    parameters,
-    max_norm=1.0
-)
+```
+max_norm = 1.0
 ```
 
-Prevents exploding gradients.
-
----
-
-### CuDNN Benchmark
-
-```python
-torch.backends.cudnn.benchmark = True
-```
-
-Allows PyTorch to select the fastest convolution algorithm for fixed image sizes.
-
----
-
-### Optimized Data Loading
-
-```python
-DataLoader(
-    batch_size=32,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True
-)
-```
-
-Features:
-
-* Parallel data loading
-* Faster CPU → GPU transfer
-* Improved GPU utilization
+prevents unstable parameter updates.
 
 ---
 
 ## Dataset
 
-Images are loaded using a custom PyTorch Dataset class.
+Training images are loaded directly from folders.
 
-Supported image formats:
+Supported formats
 
-* PNG
-* JPG
-* JPEG
-* TIFF
+- PNG
+- JPG
+- JPEG
+- TIFF
 
-Images are:
+Image preprocessing includes
 
-1. Randomly cropped to:
-
-```python
-1024 × 1024
-```
-
-2. Converted to tensors.
-
-3. Normalized:
-
-```python
-mean = [0.5, 0.5, 0.5]
-std  = [0.5, 0.5, 0.5]
-```
+- Random Crop (training)
+- Center Crop (validation)
+- Normalization
+- Tensor conversion
 
 ---
 
-## Hyperparameters
+## Metrics
 
-| Parameter                 | Value          |
-| ------------------------- | -------------- |
-| Epochs                    | 80             |
-| Latent Dimension          | 256            |
-| Learning Rate             | 1e-4           |
-| Batch Size                | 32             |
-| Optimizer                 | Adam           |
-| Activation                | LeakyReLU(0.2) |
-| Reconstruction Loss       | MSE            |
-| KL Weight (α)             | 0.001          |
-| Reconstruction Weight (β) | 1.0            |
+The model evaluates reconstruction quality using
+
+- PSNR
+- SSIM
+
+These are computed on every validation epoch.
 
 ---
 
-## Dependencies
+## TensorBoard Logging
 
-Install required packages:
+The repository logs a large number of statistics including
 
-```bash
-pip install torch torchvision pillow
-```
+### Losses
+
+- Training Loss
+- Validation Loss
+- Reconstruction Loss
+- KL Loss
+
+### Metrics
+
+- PSNR
+- SSIM
+
+### GPU
+
+- Memory Usage
+- Reserved Memory
+
+### Diagnostics
+
+- Mean Distribution
+- Log Variance Distribution
+- exp(logvar)
+- Gradient Norm
+- Latent Histograms
+
+### Images
+
+- Original vs Reconstruction
+- Randomly Generated Samples
+
+### Latent Space
+
+Embedding visualization of learned latent vectors.
 
 ---
 
-## Training
+## Mixed Precision Training
 
-Run:
+Training uses
 
-```bash
-python train.py
+```
+torch.autocast()
 ```
 
-During training, the script prints:
+and
 
-```text
-Epoch [1/80] | Loss: ... | Recon: ... | KL: ...
 ```
+GradScaler
+```
+
+to
+
+- reduce memory usage
+- speed up training
+- maintain numerical stability
 
 ---
 
-## Model Checkpoint
+## Checkpointing
 
-The best model is automatically saved as:
+The best model is automatically saved whenever validation loss improves.
 
-```text
-vae_best.pth
+Saved checkpoint contains
+
+- Encoder weights
+- Decoder weights
+- Optimizer state
+- Current epoch
+- Training loss
+- Validation loss
+- Reconstruction loss
+- KL loss
+
+---
+
+## Training Pipeline
+
 ```
-
-Saved information:
-
-* Epoch number
-* Encoder weights
-* Decoder weights
-* Optimizer state
-* Best loss
-* Reconstruction loss
-* KL loss
+Load Dataset
+      ↓
+DataLoader
+      ↓
+Encoder
+      ↓
+Latent Distribution
+      ↓
+Reparameterization
+      ↓
+Decoder
+      ↓
+Reconstruction
+      ↓
+Loss Computation
+      ↓
+Backpropagation
+      ↓
+Gradient Clipping
+      ↓
+Optimizer Update
+      ↓
+Validation
+      ↓
+TensorBoard Logging
+      ↓
+Save Best Model
+```
 
 ---
 
 ## Repository Structure
 
-```text
+```
 .
 ├── train.py
-├── README.md
+├── model.py
+├── runs/
+├── checkpoints/
 ├── vae_best.pth
-└── dataset/
+└── README.md
 ```
+
+---
+
+## Requirements
+
+- Python 3.10+
+- PyTorch
+- Torchvision
+- TorchMetrics
+- Pillow
+- TensorBoard
+
+Install dependencies
+
+```bash
+pip install torch torchvision torchmetrics pillow tensorboard
+```
+
+---
+
+## Running
+
+```bash
+python train.py
+```
+
+TensorBoard
+
+```bash
+tensorboard --logdir=runs
+```
+
+---
+
+## Output
+
+The training process produces
+
+- Model checkpoints
+- TensorBoard logs
+- Image reconstructions
+- Random image generations
+- Latent space embeddings
+- PSNR/SSIM metrics
+
+---
+
+## Learning Outcomes
+
+This project demonstrates practical implementation of
+
+- Variational Autoencoders
+- Representation Learning
+- Latent Variable Models
+- Mixed Precision Training
+- Probabilistic Deep Learning
+- Reconstruction-based Generative Models
+- TensorBoard Experiment Tracking
+- Stable Deep Learning Training Techniques
 
 ---
 
 ## Future Improvements
 
-* β-VAE
-* Conditional VAE
-* VQ-VAE
-* Attention-based VAE
-* Perceptual Loss
-* SSIM Loss
-* Residual Blocks
-* U-Net Decoder
-
----
-
-## Author
-
-**Vansh Hosh**
-
-School of Artificial Intelligence
-Bennett University
+- β-VAE
+- Conditional VAE
+- Vector Quantized VAE (VQ-VAE)
+- Hierarchical VAE
+- Perceptual Loss
+- Adversarial VAE
+- Diffusion Prior
+- Latent Diffusion Models
 
 ---
 
 ## License
 
-This project is open-source and available under the MIT License.
+This project is intended for educational and research purposes.
