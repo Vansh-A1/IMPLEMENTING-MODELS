@@ -89,8 +89,8 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
-train_path      = "/data/projectwork/HR_IMAGES/train_test"
-validation_path = "/data/projectwork/HR_IMAGES/validation_test"
+train_path      = "/data/projectwork/HR_IMAGES/train"
+validation_path = "/data/projectwork/HR_IMAGES/validation"
 
 train_dataset      = VAE_DATASET(train_path,      train_transform)
 validation_dataset = VAE_DATASET(validation_path, val_transform)
