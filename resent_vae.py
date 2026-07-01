@@ -1,5 +1,4 @@
 import os
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,40 +7,52 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Parameters
 # ══════════════════════════════════════════════════════════════════════════════
-EPOCHS         = 80
-LATENT_CH      = 16
-LR             = 1e-4
+EPOCHS            = 80
+LATENT_CH         = 16
+LR                = 1e-4
 
-# ---- KL / capacity schedule -------------------------------------------------
-# Instead of a near-zero fixed KL weight (which turns this into an autoencoder
-# with a decorative KL term), we use CAPACITY ANNEALING (Burgess et al. 2018).
-# We target an explicit information budget C (in nats, summed over the whole
-# latent tensor) that grows linearly from ~0 to C_MAX over C_WARMUP_EPOCHS,
-# and penalize the *distance* of KL from that budget rather than penalizing
-# KL directly. This gives you direct, interpretable control over how much
-# information the latent is allowed to carry, instead of hoping a weight
-# constant happens to land in the right regime.
-KL_BASE_WEIGHT = 1.0        # weight on the capacity-distance penalty (gamma in the paper)
-C_MAX          = 1024.0     # target nats budget at full warmup (tune: latent has 16*8*8=1024 dims)
-C_WARMUP_EPOCHS = 40         # epochs to linearly ramp capacity 0 -> C_MAX
-FREE_BITS      = 0.05       # small residual per-dim floor, mostly a safety net now that
-                             # capacity annealing is doing the real work
+KL_WEIGHT         = 1e-2     # final beta once warmup completes (standard beta-VAE weight)
+KL_WARMUP_EPOCHS  = 20       # linear ramp of beta from 0 -> KL_WEIGHT
 
-MSE_W          = 0.5
-PERCEPTUAL_W   = 1.0
-GRAD_CLIP      = 1.0
-ACCUM_STEPS    = 4           # gradient accumulation -> effective batch size 2*4=8 at 1024^2
+# ── Free bits ────────────────────────────────────────────────────────────────
+# Applied per CHANNEL GROUP (16 groups), NOT per individual scalar latent
+# position. The latent is (16, 8, 8) = 1024 scalars; the previous implementation
+# floored each of the 1024 positions independently at 0.5 nats, giving an
+# inescapable 1024*0.5=512-nat floor that dominated the loss and had zero
+# gradient for ~85% of the latent (torch.clamp's gradient is 0 below the
+# floor). Here each channel's KL is SUMMED over its 8x8 spatial extent and
+# averaged over the batch before the floor is applied -- this keeps it on the
+# same "total nats" scale as the real ELBO KL term (kl_true_mean below), and
+# only requires 16 groups (not 1024 scalars) to individually clear the bar.
+# 2.0 nats/channel * 16 channels = 32-nat total floor. At the fully warmed-up
+# kl_weight=0.01 that contributes 0.32 to the loss -- comparable to, not 5-6x
+# larger than, MSE+perceptual (~0.9). Tune this value if you want a stronger
+# or weaker regularizer; keep it well below the natural scale of MSE+perceptual
+# once multiplied by KL_WEIGHT.
+FREE_BITS_PER_CHANNEL = 2.0
 
-LOGVAR_MIN     = -6.0        # tightened from -10: prevents near-deterministic per-dim collapse
-LOGVAR_MAX     = 6.0
+MSE_W             = 0.5
+PERCEPTUAL_W      = 1.0
+GRAD_CLIP         = 1.0
+ACCUM_STEPS       = 4        # gradient accumulation -> effective batch size 2*4=8 at 1024^2
 
-OUTPUT_DIR     = "/data/projectwork/HR_IMAGES/training_output"
+LOGVAR_MIN        = -6.0
+LOGVAR_MAX        = 6.0
+
+WARMUP_FRACTION   = 0.05     # fraction of TOTAL optimizer steps spent on LR warmup.
+                              # Fix: previously a hard-coded 500-step warmup assumed a
+                              # much larger dataset. With this dataset's actual step
+                              # count per epoch, 500 steps took ~50 of 80 epochs to
+                              # complete -- most of training ran at a tiny fraction of
+                              # the target LR. Deriving it as a % of total steps makes
+                              # it correct regardless of dataset size.
+
+OUTPUT_DIR        = "/home/projectwork/Deep_learning/VANSH_WORK/Internship/VAE/VAE_1_MSE/resnet_vae"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,8 +89,8 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
-train_path      = "/data/projectwork/HR_IMAGES/train"
-validation_path = "/data/projectwork/HR_IMAGES/validation"
+train_path      = "/data/projectwork/HR_IMAGES/train_test"
+validation_path = "/data/projectwork/HR_IMAGES/validation_test"
 
 train_dataset      = VAE_DATASET(train_path,      train_transform)
 validation_dataset = VAE_DATASET(validation_path, val_transform)
@@ -93,12 +104,24 @@ validation_dataloader = DataLoader(
     num_workers=4, pin_memory=True, persistent_workers=True,
 )
 
+# ── Dynamic warmup / cosine schedule lengths ──────────────────────────────────
+# Computed from the ACTUAL dataloader length instead of hard-coded, so the LR
+# schedule is correct regardless of dataset size (see WARMUP_FRACTION comment).
+STEPS_PER_EPOCH       = max(1, len(train_dataloader) // ACCUM_STEPS)
+TOTAL_OPTIMIZER_STEPS = EPOCHS * STEPS_PER_EPOCH
+WARMUP_STEPS          = max(1, int(WARMUP_FRACTION * TOTAL_OPTIMIZER_STEPS))
+COSINE_STEPS          = max(1, TOTAL_OPTIMIZER_STEPS - WARMUP_STEPS)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Building Blocks
 # ══════════════════════════════════════════════════════════════════════════════
 class ResBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 8):
+    """zero_init controls whether conv2's weights start at zero (near-identity
+    block at init). Only the LAST block in each stage is zero-init'd, so most
+    residual paths carry real gradient from step 1."""
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 8,
+                 zero_init: bool = True):
         super().__init__()
         self.norm1 = nn.GroupNorm(num_groups, in_ch)
         self.act1  = nn.SiLU()
@@ -116,12 +139,13 @@ class ResBlock(nn.Module):
             if (in_ch != out_ch or stride != 1)
             else nn.Identity()
         )
-        self._init_weights()
+        self._init_weights(zero_init)
 
-    def _init_weights(self):
+    def _init_weights(self, zero_init):
         nn.init.kaiming_normal_(self.conv1.weight, nonlinearity="relu")
         nn.init.kaiming_normal_(self.conv2.weight, nonlinearity="relu")
-        nn.init.zeros_(self.conv2.weight)
+        if zero_init:
+            nn.init.zeros_(self.conv2.weight)
 
     def forward(self, x):
         h = self.conv1(self.act1(self.norm1(x)))
@@ -130,9 +154,10 @@ class ResBlock(nn.Module):
 
 
 def make_enc_stage(in_ch: int, out_ch: int, num_blocks: int) -> nn.Sequential:
-    layers = [ResBlock(in_ch, out_ch, stride=2)]
-    for _ in range(1, num_blocks):
-        layers.append(ResBlock(out_ch, out_ch, stride=1))
+    layers = [ResBlock(in_ch, out_ch, stride=2, zero_init=False)]
+    for i in range(1, num_blocks):
+        is_last = (i == num_blocks - 1)
+        layers.append(ResBlock(out_ch, out_ch, stride=1, zero_init=is_last))
     return nn.Sequential(*layers)
 
 
@@ -145,7 +170,7 @@ class UpsampleBlock(nn.Module):
             nn.GroupNorm(num_groups, out_ch),
             nn.SiLU(),
         )
-        self.res = ResBlock(out_ch, out_ch, stride=1, num_groups=num_groups)
+        self.res = ResBlock(out_ch, out_ch, stride=1, num_groups=num_groups, zero_init=False)
 
     def forward(self, x):
         return self.res(self.up(x))
@@ -176,7 +201,6 @@ class ResNetEncoder(nn.Module):
         self.conv_mu     = nn.Conv2d(512, latent_ch, kernel_size=1)
         self.conv_logvar = nn.Conv2d(512, latent_ch, kernel_size=1)
 
-        # zero-init logvar -> starts outputting unit Gaussian, stable early training
         nn.init.zeros_(self.conv_logvar.weight)
         nn.init.zeros_(self.conv_logvar.bias)
 
@@ -195,12 +219,7 @@ class ResNetEncoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Decoder
-# (Deliberately NO encoder-decoder skip connections. This is a design choice,
-#  not an omission: skips let the decoder bypass the latent bottleneck, which
-#  directly works against learning a meaningful, information-carrying latent.
-#  Expect lower PSNR than a skip-connected version -- that's the trade-off
-#  you're explicitly making by prioritizing distribution learning.)
+# Decoder — no skip connections (kept as-is)
 # ══════════════════════════════════════════════════════════════════════════════
 class ResNetDecoder(nn.Module):
     def __init__(self, latent_ch: int = 16):
@@ -246,12 +265,6 @@ class ResNetVAE(nn.Module):
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor, training: bool) -> torch.Tensor:
-        # Tied explicitly to module training mode rather than autograd context.
-        # Deterministic (mean) reconstruction is used at eval time; stochastic
-        # sampling is used during training. If you want to evaluate this model
-        # as a *generative* model (sample z ~ N(0,I) and decode) rather than as
-        # a reconstruction model (encode -> mean -> decode), do that separately
-        # -- these measure very different things and should not be conflated.
         if not training:
             return mu
         return mu + (0.5 * logvar).exp() * torch.randn_like(mu)
@@ -264,23 +277,18 @@ class ResNetVAE(nn.Module):
 
     @torch.no_grad()
     def sample(self, n: int, latent_ch: int, spatial: int, device):
-        """Pure generative sampling: draw z ~ N(0, I) and decode. This is the
-        real test of whether the latent has learned a usable prior-matched
-        distribution, independent of reconstruction quality."""
         z = torch.randn(n, latent_ch, spatial, spatial, device=device)
         return self.decoder(z)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VGG Perceptual Loss (multi-crop, since a single global 256x256 downsample
-# from 1024x1024 throws away most fine-detail supervision perceptual loss is
-# meant to provide)
+# VGG Perceptual Loss
 # ══════════════════════════════════════════════════════════════════════════════
 class VGGPerceptualLoss(nn.Module):
     LAYER_IDS     = {3, 8, 15, 22}
     LAYER_WEIGHTS = {3: 0.5, 8: 1.0, 15: 1.5, 22: 2.0}
     CROP          = 256
-    NUM_CROPS     = 3   # random crops per image per forward pass, in addition to a global resize
+    NUM_CROPS     = 3
 
     def __init__(self):
         super().__init__()
@@ -327,7 +335,6 @@ class VGGPerceptualLoss(nn.Module):
         B, C, H, W = recon.shape
         losses = []
 
-        # 1) global downsampled view -- captures coarse structure/color
         r_global = F.interpolate(self._normalize(recon), size=(self.CROP, self.CROP),
                                   mode="bilinear", align_corners=False)
         t_global = F.interpolate(self._normalize(target.detach()), size=(self.CROP, self.CROP),
@@ -336,7 +343,6 @@ class VGGPerceptualLoss(nn.Module):
         ft = self._vgg_forward(t_global)
         losses.append(self._feature_loss(fr, ft))
 
-        # 2) random full-resolution crops -- captures fine texture detail
         if H > self.CROP and W > self.CROP:
             for _ in range(self.NUM_CROPS):
                 top  = torch.randint(0, H - self.CROP + 1, (1,)).item()
@@ -351,55 +357,56 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Loss — Capacity-Annealed KL (Burgess et al., "Understanding disentangling
-# in beta-VAE", 2018) with a small residual free-bits floor.
-#
-# Standard beta-VAE penalizes KL directly: L = Recon + beta * KL
-# This makes it hard to reason about *how much* information the latent
-# actually carries -- a fixed beta doesn't tell you the resulting nats budget.
-#
-# Capacity annealing instead targets an explicit budget C (in nats) and
-# penalizes the *distance* from that budget:
-#     L = Recon + gamma * |KL - C|
-# C is annealed from 0 up to C_MAX over training. Early on the model is
-# forced to use very little capacity (near-autoencoder-with-noise regime,
-# stable), and capacity is gradually released, letting the encoder decide
-# how to allocate it across dimensions as more room becomes available.
-# This gives interpretable, direct control over the information bottleneck
-# instead of an opaque weight constant.
+# KL divergence + Free Bits (fixed: grouped by channel, correctly scaled)
 # ══════════════════════════════════════════════════════════════════════════════
-def capacity_for_epoch(epoch: int) -> float:
-    frac = min(1.0, epoch / C_WARMUP_EPOCHS)
-    return C_MAX * frac
+def compute_kl(mu: torch.Tensor, logvar: torch.Tensor):
+    """
+    mu, logvar: (B, C, H, W)
+
+    Returns:
+        kl_for_backward : scalar used in the loss. Free bits applied per
+                           CHANNEL GROUP (16 groups), not per individual
+                           scalar latent position.
+        kl_true_mean    : scalar, the TRUE unfloored per-sample total KL,
+                           averaged over the batch. This is the honest,
+                           standard VAE KL term -- nothing is floored here.
+                           Used for logging/diagnostics only, so printed
+                           numbers always reflect real training progress.
+        kl_per_channel  : (C,) true per-channel KL (summed over spatial,
+                           averaged over batch) -- used for the
+                           active-channel diagnostic.
+    """
+    kl_per_element = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())   # (B,C,H,W), >= 0
+
+    kl_true_mean = kl_per_element.sum(dim=(1, 2, 3)).mean()
+
+    kl_per_channel_persample = kl_per_element.sum(dim=(2, 3))           # (B, C) -- sum over spatial
+    kl_per_channel = kl_per_channel_persample.mean(dim=0)                # (C,)   -- mean over batch
+    kl_per_channel_floored = torch.clamp(kl_per_channel, min=FREE_BITS_PER_CHANNEL)
+
+    kl_for_backward = kl_per_channel_floored.sum()
+
+    return kl_for_backward, kl_true_mean, kl_per_channel.detach()
 
 
-def vae_loss(recon, target, mu, logvar, perceptual_fn, capacity, free_bits=FREE_BITS):
+def kl_weight_for_epoch(epoch: int) -> float:
+    if KL_WARMUP_EPOCHS <= 0:
+        return KL_WEIGHT
+    frac = min(1.0, epoch / KL_WARMUP_EPOCHS)
+    return KL_WEIGHT * frac
+
+
+def vae_loss(recon, target, mu, logvar, perceptual_fn, kl_weight):
     mse_loss  = F.mse_loss(recon, target, reduction="mean")
     perc_loss = perceptual_fn(recon, target)
 
-    # KL per spatial location and channel: shape (B, C, H, W)
-    kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+    kl_for_backward, kl_true_mean, kl_per_channel = compute_kl(mu, logvar)
 
-    # small residual free-bits floor as a safety net against total collapse
-    # in any individual dimension, on top of capacity annealing
-    kl_floored = torch.clamp(kl_per_dim, min=free_bits)
+    total = MSE_W * mse_loss + PERCEPTUAL_W * perc_loss + kl_weight * kl_for_backward
 
-    # total KL in nats, summed over latent dims, averaged over batch
-    B = kl_floored.shape[0]
-    kl_sum_per_sample = kl_floored.view(B, -1).sum(dim=1)   # (B,)
-    kl_total = kl_sum_per_sample.mean()
+    active_units = (kl_per_channel > 0.1).float().mean().item()   # fraction of 16 channels "in use"
 
-    # capacity-distance penalty
-    kl_capacity_loss = KL_BASE_WEIGHT * (kl_total - capacity).abs()
-
-    # raw (unfloored) KL, for diagnostics -- shows true collapse if it happens
-    kl_raw = kl_per_dim.view(B, -1).sum(dim=1).mean()
-
-    active_units = (kl_per_dim.detach().mean(0) > 0.1).float().mean().item()
-
-    total = MSE_W * mse_loss + PERCEPTUAL_W * perc_loss + kl_capacity_loss
-
-    return total, mse_loss, perc_loss, kl_capacity_loss, kl_total, kl_raw, active_units
+    return total, mse_loss, perc_loss, kl_true_mean, active_units
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -407,27 +414,20 @@ def vae_loss(recon, target, mu, logvar, perceptual_fn, capacity, free_bits=FREE_
 # ══════════════════════════════════════════════════════════════════════════════
 def latent_diagnostics(mu: torch.Tensor, logvar: torch.Tensor) -> dict:
     with torch.no_grad():
-        kl_per_dim   = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-        active_units = (kl_per_dim.mean(0) > 0.1).float().mean().item()
-
-        # aggregate posterior stats: how far mu drifts from N(0,1) on average
-        # (large mu_abs_mean / non-unit variance across the batch signals the
-        # aggregate posterior q(z) is drifting away from the prior p(z) --
-        # exactly the failure mode that hurts sampling quality)
-        mu_flat = mu.detach().reshape(-1)
-        aggregate_var = mu_flat.var(unbiased=False).item()
+        kl_per_element = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        kl_per_channel = kl_per_element.sum(dim=(2, 3)).mean(dim=0)     # (C,), matches compute_kl
+        active_units   = (kl_per_channel > 0.1).float().mean().item()
 
         return {
-            "mu_max":         mu.max().item(),
-            "mu_min":         mu.min().item(),
-            "mu_abs_mean":    mu.abs().mean().item(),
-            "lv_max":         logvar.max().item(),
-            "lv_min":         logvar.min().item(),
-            "lv_mean":        logvar.mean().item(),
-            "explv_max":      logvar.exp().max().item(),
-            "kl_raw_mean":    kl_per_dim.mean().item(),
-            "active_units":   active_units,
-            "aggregate_mu_var": aggregate_var,   # want this near 1.0 for a sample-able prior
+            "mu_max":       mu.max().item(),
+            "mu_min":       mu.min().item(),
+            "mu_abs_mean":  mu.abs().mean().item(),
+            "lv_max":       logvar.max().item(),
+            "lv_min":       logvar.min().item(),
+            "lv_mean":      logvar.mean().item(),
+            "explv_max":    logvar.exp().max().item(),
+            "kl_mean":      kl_per_element.mean().item(),
+            "active_units": active_units,
         }
 
 
@@ -440,40 +440,53 @@ def average_diag(acc: dict, n: int) -> dict:
     return {k: v / n for k, v in acc.items()}
 
 
-def log_scalars(writer, prefix, d, step):
-    for k, v in d.items():
-        writer.add_scalar(f"{prefix}/{k}", v, step)
-
-
-def print_train_step(epoch, epochs, step, loss, mse, perc, kl_cap_loss, kl_total, kl_raw, capacity, active, diag):
+def print_train_step(epoch, epochs, step, loss, mse, perc, kl, kl_w, active, diag, lr):
     print(
         f"  Ep {epoch:>3}/{epochs}  step {step:>4} │ "
         f"loss={loss:.4f}  mse={mse:.4f}  perc={perc:.4f}  "
-        f"kl_cap_loss={kl_cap_loss:.4f}  kl_total={kl_total:.2f}  kl_raw={kl_raw:.2f}  "
-        f"target_C={capacity:.1f} │ "
+        f"kl={kl:.4f}  kl_w={kl_w:.6f}  lr={lr:.2e} │ "
         f"active={active*100:.1f}%  "
-        f"mu_abs={diag['mu_abs_mean']:.4f}  agg_mu_var={diag['aggregate_mu_var']:.4f}  "
-        f"lv_mean={diag['lv_mean']:.4f}"
+        f"mu_abs={diag['mu_abs_mean']:.4f}  "
+        f"mu=[{diag['mu_min']:.3f},{diag['mu_max']:.3f}]  "
+        f"lv_mean={diag['lv_mean']:.4f}  "
+        f"lv=[{diag['lv_min']:.3f},{diag['lv_max']:.3f}]"
     )
 
 
 def print_epoch_summary(tag, epoch, epochs, losses, diag, extra=""):
     print(
-        f"\n{'─'*110}\n"
+        f"\n{'─'*100}\n"
         f"  [{tag}] Ep {epoch:>3}/{epochs} │ "
         f"loss={losses['total']:.4f}  mse={losses['mse']:.4f}  "
-        f"perc={losses['perc']:.4f}  kl_cap_loss={losses['kl_cap_loss']:.4f}  "
-        f"kl_total={losses['kl_total']:.2f}  kl_raw={losses['kl_raw']:.2f}{extra}\n"
-        f"  Latent │ "
-        f"active={diag['active_units']*100:.1f}%  "
-        f"agg_mu_var={diag['aggregate_mu_var']:.4f}  "   # most important number for generation quality
+        f"perc={losses['perc']:.4f}  kl={losses['kl']:.4f}{extra}\n"
+        f"  Latent │ active={diag['active_units']*100:.1f}%  "
         f"mu_abs={diag['mu_abs_mean']:.4f}  "
         f"mu=[{diag['mu_min']:.3f},{diag['mu_max']:.3f}]  "
         f"lv_mean={diag['lv_mean']:.4f}  "
-        f"lv=[{diag['lv_min']:.3f},{diag['lv_max']:.3f}]  "
-        f"exp(lv)_max={diag['explv_max']:.3f}\n"
-        f"{'─'*110}"
+        f"lv=[{diag['lv_min']:.3f},{diag['lv_max']:.3f}]\n"
+        f"{'─'*100}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Optimizer / Scheduler (shared by train() and resume() for consistency)
+# ══════════════════════════════════════════════════════════════════════════════
+def build_optimizer_and_scheduler(model):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-3, end_factor=1.0, total_iters=WARMUP_STEPS
+    )
+    # T_max = remaining steps AFTER warmup (fix: previously used the full step
+    # count, so SequentialLR only ever let cosine run through a fraction of
+    # its own schedule and never reached eta_min).
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=COSINE_STEPS, eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[WARMUP_STEPS]
+    )
+    return optimizer, scheduler
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -483,10 +496,8 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt_dir = os.path.join(OUTPUT_DIR, "checkpoints")
-    runs_dir = os.path.join(OUTPUT_DIR, "runs")
     log_path = os.path.join(OUTPUT_DIR, "train.log")
     os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(runs_dir, exist_ok=True)
 
     log_file = open(log_path, "a")
     def log(msg):
@@ -494,113 +505,103 @@ def train():
 
     log(f"Training on      : {device}")
     log(f"Latent shape     : (B, {LATENT_CH}, 8, 8) = {LATENT_CH * 8 * 8} dims")
-    log(f"Capacity target  : 0 -> {C_MAX} nats over {C_WARMUP_EPOCHS} epochs (capacity annealing)")
-    log(f"Free bits floor  : {FREE_BITS} nats/dim (residual safety net)")
-    log(f"Grad accumulation: {ACCUM_STEPS} steps (effective batch = {2*ACCUM_STEPS})")
+    log(f"KL weight (final): {KL_WEIGHT}, linear warmup over {KL_WARMUP_EPOCHS} epochs")
+    log(f"Free bits floor  : {FREE_BITS_PER_CHANNEL} nats/channel x {LATENT_CH} channels "
+        f"= {FREE_BITS_PER_CHANNEL * LATENT_CH:.1f} nats total (grouped, collapse prevention)")
+    log(f"LR warmup        : {WARMUP_STEPS} optimizer steps "
+        f"({WARMUP_FRACTION*100:.0f}% of {TOTAL_OPTIMIZER_STEPS} total), then cosine annealing")
+    log(f"Loss             : MSE + VGG Perceptual + beta * KL  (standard ELBO only)")
     log(f"Output dir       : {OUTPUT_DIR}\n")
 
     model     = ResNetVAE(LATENT_CH).to(device)
     perc_fn   = VGGPerceptualLoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6
-    )
-    scaler    = GradScaler("cuda")
-    writer    = SummaryWriter(log_dir=runs_dir)
+    optimizer, scheduler = build_optimizer_and_scheduler(model)
+
+    with torch.no_grad():
+        sample_x = next(iter(train_dataloader))
+        log(f"Dataset sanity check: batch mean={sample_x.mean().item():.4f} "
+            f"std={sample_x.std().item():.4f} shape={tuple(sample_x.shape)}")
+
+    scaler = GradScaler("cuda")
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
     best_val_loss = float("inf")
-    global_step   = 0
+    optimizer_step = 0
 
     for epoch in range(1, EPOCHS + 1):
-        capacity = capacity_for_epoch(epoch)
+        kl_w = kl_weight_for_epoch(epoch)
 
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        t_loss = t_mse = t_perc = t_klcap = t_kltotal = t_kl_raw = t_gnorm = t_active = 0.0
+        t_loss = t_mse = t_perc = t_kl = t_gnorm = t_active = 0.0
         train_diag_acc: dict = {}
         num_train = 0
+        n = len(train_dataloader)
 
         optimizer.zero_grad(set_to_none=True)
         for step, x in enumerate(train_dataloader, 1):
             x = x.to(device, non_blocking=True)
 
+            # Fix: scale by the TRUE size of the current accumulation window,
+            # not a fixed ACCUM_STEPS -- the final window of an epoch may be
+            # smaller if n isn't divisible by ACCUM_STEPS.
+            group_start = ((step - 1) // ACCUM_STEPS) * ACCUM_STEPS + 1
+            group_size  = min(ACCUM_STEPS, n - group_start + 1)
+
             with autocast("cuda"):
                 recon, mu, logvar = model(x)
-                loss, mse, perc, kl_cap_loss, kl_total, kl_raw, active = vae_loss(
-                    recon, x, mu, logvar, perc_fn, capacity
-                )
-                loss_scaled = loss / ACCUM_STEPS
+                loss, mse, perc, kl, active = vae_loss(recon, x, mu, logvar, perc_fn, kl_w)
+                loss_scaled = loss / group_size
 
             scaler.scale(loss_scaled).backward()
 
-            if step % ACCUM_STEPS == 0 or step == len(train_dataloader):
+            at_boundary = (step % ACCUM_STEPS == 0) or (step == n)
+            if at_boundary:
                 scaler.unscale_(optimizer)
                 grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
+                # Fix: only advance the LR scheduler if AMP actually took the
+                # step (skips the step silently on inf/nan grads).
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+
+                if scaler.get_scale() >= scale_before:
+                    scheduler.step()
+                    optimizer_step += 1
+
                 t_gnorm += grad_norm.item()
 
-            t_loss    += loss.item()
-            t_mse     += mse.item()
-            t_perc    += perc.item()
-            t_klcap   += kl_cap_loss.item()
-            t_kltotal += kl_total.item()
-            t_kl_raw  += kl_raw.item()
-            t_active  += active
-            global_step += 1
-            num_train   += 1
+            t_loss   += loss.item()
+            t_mse    += mse.item()
+            t_perc   += perc.item()
+            t_kl     += kl.item()
+            t_active += active
+            num_train += 1
 
             diag = latent_diagnostics(mu, logvar)
             accumulate_diag(train_diag_acc, diag)
 
-            writer.add_scalar("step/loss",         loss.item(),         global_step)
-            writer.add_scalar("step/mse",          mse.item(),          global_step)
-            writer.add_scalar("step/perc",         perc.item(),         global_step)
-            writer.add_scalar("step/kl_cap_loss",  kl_cap_loss.item(),  global_step)
-            writer.add_scalar("step/kl_total",     kl_total.item(),     global_step)
-            writer.add_scalar("step/kl_raw",       kl_raw.item(),       global_step)
-            writer.add_scalar("step/active_units", active,              global_step)
-            writer.add_scalar("step/aggregate_mu_var", diag["aggregate_mu_var"], global_step)
-
             if step % 50 == 0:
-                print_train_step(epoch, EPOCHS, step, loss.item(), mse.item(), perc.item(),
-                                  kl_cap_loss.item(), kl_total.item(), kl_raw.item(),
-                                  capacity, active, diag)
+                print_train_step(epoch, EPOCHS, step, loss.item(), mse.item(),
+                                  perc.item(), kl.item(), kl_w, active, diag,
+                                  optimizer.param_groups[0]["lr"])
 
-        n = len(train_dataloader)
         n_accum_steps = max(1, n // ACCUM_STEPS)
         avg_train = {
-            "total":       t_loss    / n,
-            "mse":         t_mse     / n,
-            "perc":        t_perc    / n,
-            "kl_cap_loss": t_klcap   / n,
-            "kl_total":    t_kltotal / n,
-            "kl_raw":      t_kl_raw  / n,
+            "total": t_loss / n, "mse": t_mse / n, "perc": t_perc / n, "kl": t_kl / n,
         }
         avg_gnorm      = t_gnorm  / n_accum_steps
         avg_active     = t_active / n
         avg_train_diag = average_diag(train_diag_acc, num_train)
 
-        log_scalars(writer, "train/loss",  avg_train,      epoch)
-        log_scalars(writer, "train/diag",  avg_train_diag, epoch)
-        writer.add_scalar("train/grad_norm",   avg_gnorm,  epoch)
-        writer.add_scalar("train/active_units",avg_active, epoch)
-        writer.add_scalar("train/capacity_target", capacity, epoch)
-        writer.add_scalar("train/lr",          scheduler.get_last_lr()[0], epoch)
-        if torch.cuda.is_available():
-            writer.add_scalar("gpu/mem_allocated_MB",
-                              torch.cuda.memory_allocated(device) / 1e6, epoch)
-            writer.add_scalar("gpu/mem_reserved_MB",
-                              torch.cuda.memory_reserved(device)  / 1e6, epoch)
-
         print_epoch_summary(
             "TRAIN", epoch, EPOCHS, avg_train, avg_train_diag,
             extra=f"  active={avg_active*100:.1f}%  grad_norm={avg_gnorm:.4f}  "
-                  f"capacity_target={capacity:.1f}  lr={scheduler.get_last_lr()[0]:.2e}"
+                  f"kl_w={kl_w:.6f}  lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
         # ── Validation ────────────────────────────────────────────────────────
@@ -608,7 +609,7 @@ def train():
         psnr_metric.reset()
         ssim_metric.reset()
 
-        v_loss = v_mse = v_perc = v_klcap = v_kltotal = v_kl_raw = v_active = 0.0
+        v_loss = v_mse = v_perc = v_kl = v_active = 0.0
         val_diag_acc: dict = {}
         num_val = 0
 
@@ -617,17 +618,13 @@ def train():
                 x = x.to(device, non_blocking=True)
                 with autocast("cuda"):
                     recon, mu, logvar = model(x)
-                    loss, mse, perc, kl_cap_loss, kl_total, kl_raw, active = vae_loss(
-                        recon, x, mu, logvar, perc_fn, capacity
-                    )
-                v_loss    += loss.item()
-                v_mse     += mse.item()
-                v_perc    += perc.item()
-                v_klcap   += kl_cap_loss.item()
-                v_kltotal += kl_total.item()
-                v_kl_raw  += kl_raw.item()
-                v_active  += active
-                num_val   += 1
+                    loss, mse, perc, kl, active = vae_loss(recon, x, mu, logvar, perc_fn, kl_w)
+                v_loss   += loss.item()
+                v_mse    += mse.item()
+                v_perc   += perc.item()
+                v_kl     += kl.item()
+                v_active += active
+                num_val  += 1
 
                 diag = latent_diagnostics(mu, logvar)
                 accumulate_diag(val_diag_acc, diag)
@@ -639,51 +636,26 @@ def train():
 
         nv = len(validation_dataloader)
         avg_val = {
-            "total":       v_loss    / nv,
-            "mse":         v_mse     / nv,
-            "perc":        v_perc    / nv,
-            "kl_cap_loss": v_klcap   / nv,
-            "kl_total":    v_kltotal / nv,
-            "kl_raw":      v_kl_raw  / nv,
+            "total": v_loss / nv, "mse": v_mse / nv, "perc": v_perc / nv, "kl": v_kl / nv,
         }
         avg_val_active = v_active / num_val
         avg_val_diag   = average_diag(val_diag_acc, num_val)
         avg_psnr       = psnr_metric.compute().item()
         avg_ssim       = ssim_metric.compute().item()
 
-        log_scalars(writer, "val/loss",  avg_val,      epoch)
-        log_scalars(writer, "val/diag",  avg_val_diag, epoch)
-        writer.add_scalar("val/active_units", avg_val_active, epoch)
-        writer.add_scalar("val/psnr",         avg_psnr,       epoch)
-        writer.add_scalar("val/ssim",         avg_ssim,       epoch)
-
         print_epoch_summary(
             "VAL", epoch, EPOCHS, avg_val, avg_val_diag,
-            extra=f"  active={avg_val_active*100:.1f}%  "
-                  f"PSNR={avg_psnr:.2f}dB  SSIM={avg_ssim:.4f}"
+            extra=f"  active={avg_val_active*100:.1f}%  PSNR={avg_psnr:.2f}dB  SSIM={avg_ssim:.4f}"
         )
         log(
             f"  [VAL] Ep {epoch:>3}/{EPOCHS} │ "
             f"loss={avg_val['total']:.4f}  mse={avg_val['mse']:.4f}  "
-            f"perc={avg_val['perc']:.4f}  kl_cap_loss={avg_val['kl_cap_loss']:.4f}  "
-            f"kl_total={avg_val['kl_total']:.2f}  kl_raw={avg_val['kl_raw']:.2f}  "
+            f"perc={avg_val['perc']:.4f}  kl={avg_val['kl']:.4f}  "
             f"active={avg_val_active*100:.1f}%  "
             f"PSNR={avg_psnr:.2f}dB  SSIM={avg_ssim:.4f}  "
-            f"agg_mu_var={avg_val_diag['aggregate_mu_var']:.4f}  "
             f"mu_abs={avg_val_diag['mu_abs_mean']:.4f}  "
             f"lv_mean={avg_val_diag['lv_mean']:.4f}"
         )
-
-        # ── Generation sanity check every 5 epochs ──────────────────────────
-        # Decodes pure N(0,I) noise -- the real test of whether the latent has
-        # learned something sample-able, independent of reconstruction quality.
-        if epoch % 5 == 0 or epoch == EPOCHS:
-            with torch.no_grad():
-                samples = model.sample(n=4, latent_ch=LATENT_CH, spatial=8, device=device)
-                samples_01 = ((samples + 1) / 2).clamp(0, 1)
-                writer.add_images("generation/prior_samples", samples_01, epoch)
-
-        scheduler.step()
 
         ckpt = {
             "epoch":     epoch,
@@ -704,7 +676,6 @@ def train():
             log(f"  ✓ Best saved  (val={best_val_loss:.4f}  "
                 f"PSNR={avg_psnr:.2f}dB  SSIM={avg_ssim:.4f})")
 
-    writer.close()
     log_file.close()
     print("Training complete.")
 
@@ -717,12 +688,9 @@ def resume(ckpt_path: str):
     ckpt      = torch.load(ckpt_path, map_location=device)
     latent_ch = ckpt.get("latent_ch", LATENT_CH)
 
-    model     = ResNetVAE(latent_ch).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6
-    )
-    scaler    = GradScaler("cuda")
+    model = ResNetVAE(latent_ch).to(device)
+    optimizer, scheduler = build_optimizer_and_scheduler(model)
+    scaler = GradScaler("cuda")
 
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
