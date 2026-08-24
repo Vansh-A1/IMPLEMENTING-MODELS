@@ -5,6 +5,12 @@ from torchvision import datasets
 from torchvision import transforms
 import matplotlib.pyplot as plt
 import math
+import os
+
+os.makedirs("checkpoints", exist_ok=True)
+os.makedirs("samples", exist_ok=True)
+
+best_loss = float("inf")
 
 # =========================================================
 # Config
@@ -335,10 +341,6 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = nn.MSELoss()
 
-    # NOTE: AMP/GradScaler intentionally removed for this first debugging pass
-    # (see item 21) - plain FP32 makes shape/architecture errors easier to see.
-    # Re-add autocast + GradScaler once you've confirmed correctness.
-
     for epoch in range(epochs):
         running_loss = 0.0
         for xo, _ in dataloader:
@@ -357,3 +359,76 @@ if __name__ == "__main__":
 
         avg_loss = running_loss / len(dataloader)
         print(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}")
+
+        # =========================================================
+        # SAVE LAST CHECKPOINT (every epoch)
+        # =========================================================
+        last_checkpoint = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": avg_loss,
+        }
+        torch.save(last_checkpoint, "checkpoints/last.pt")
+
+        # =========================================================
+        # SAVE BEST CHECKPOINT
+        # =========================================================
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+
+            best_checkpoint = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg_loss,
+            }
+            torch.save(best_checkpoint, "checkpoints/best.pt")
+
+            print(f"  ✓ New best model saved! Loss: {best_loss:.4f}")
+
+        # =========================================================
+        # SAVE IMAGE EVERY 10 EPOCHS
+        # =========================================================
+        if (epoch + 1) % 10 == 0:
+            model.eval()
+
+            with torch.no_grad():
+                x_real, _ = next(iter(dataloader))
+                x_real = x_real[:8].to(device)
+
+                t = torch.randint(
+                    0, num_timesteps, (x_real.shape[0],), device=device
+                ).long()
+
+                x_t, actual_noise = forward_diffusion(x_real, t)
+                predicted_noise = model(x_t, t)
+
+            x_t_display = (x_t + 1) / 2
+            actual_noise_display = (actual_noise + 1) / 2
+            predicted_noise_display = (predicted_noise + 1) / 2
+
+            fig, axes = plt.subplots(3, 8, figsize=(16, 6))
+
+            for i in range(8):
+                axes[0, i].imshow(x_real[i].cpu().squeeze(), cmap="gray")
+                axes[0, i].axis("off")
+
+                axes[1, i].imshow(x_t_display[i].cpu().squeeze(), cmap="gray")
+                axes[1, i].axis("off")
+
+                axes[2, i].imshow(predicted_noise_display[i].cpu().squeeze(), cmap="gray")
+                axes[2, i].axis("off")
+
+            axes[0, 0].set_ylabel("Original")
+            axes[1, 0].set_ylabel("Noisy")
+            axes[2, 0].set_ylabel("Predicted Noise")
+
+            plt.suptitle(f"DDPM Epoch {epoch + 1} | Loss: {avg_loss:.4f}")
+            plt.tight_layout()
+            plt.savefig(f"samples/epoch_{epoch + 1:03d}.png")
+            plt.close()
+
+            model.train()
+
+            print(f"  ✓ Image saved: samples/epoch_{epoch + 1:03d}.png")
